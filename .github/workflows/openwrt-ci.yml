@@ -50,7 +50,7 @@ jobs:
           ./scripts/feeds install -a
       - name: Download config file
         run: |
-          wget -O .config https://cdn.pzwa.net/file/pzwashare/configabc
+          wget -O .config https://cdn.pzwa.net/file/pzwashare/configax3600
       
       - name: Generate configuration file
         run: make defconfig
