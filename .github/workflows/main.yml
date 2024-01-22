@@ -5,7 +5,7 @@
 #
 # Copyright (C) 2020 KFERMercer
 #
-name: b2
+name: x86-64
 
 on:
   release:
@@ -39,7 +39,14 @@ jobs:
           
       - name: Checkout OpenWrt
         uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
 
+      - name: Cache
+        uses: klever1988/cachewrtbuild@main
+        with:
+          ccache: 'true'
+          prefix: ${{ github.workspace }}/openwrt
 
       - name: Update feeds
         run: |
@@ -61,7 +68,7 @@ jobs:
           
       - name: Compile firmware
         run: |
-          make -j$(nproc) || make -j1 V=s
+          make V=s -j$(nproc)
           echo "======================="
           echo "Space usage:"
           echo "======================="
@@ -73,35 +80,16 @@ jobs:
       - name: Sync artifacts to b2
         run: |
           b2 authorize-account $B2_APPKEY_ID $B2_APPKEY
-          b2 sync --delete --replaceNewer ./bin/ $B2_BUCKET
+          b2 sync --delete --replaceNewer ./bin/targets/x86/64/openwrt-x86-64-generic-squashfs-combined-efi.img.gz $B2_BUCKET/x86-64
           b2 clear-account
         env:
           B2_APPKEY_ID: ${{ secrets.B2_APPKEY_ID }}
           B2_APPKEY: ${{ secrets.B2_APPKEY }}
           B2_BUCKET: ${{ secrets.B2_BUCKET }}
 
-      - name: Prepare artifact
-        run: |
-          mkdir -p ./artifact/package
-          mkdir -p ./artifact/buildinfo
-          rm -rf $(find ./bin/targets/ -type d -name "packages")
-          cp -rf $(find ./bin/packages/ -type f -name "*.ipk") ./artifact/package/
-          cp -rf $(find ./bin/targets/ -type f -name "*.buildinfo" -o -name "*.manifest") ./artifact/buildinfo/
-
-      - name: Upload buildinfo
-        uses: actions/upload-artifact@v3
-        with:
-          name: OpenWrt_buildinfo
-          path: ./artifact/buildinfo/
-
-      - name: Upload package
-        uses: actions/upload-artifact@v3
-        with:
-          name: OpenWrt_package
-          path: ./artifact/package/
 
       - name: Upload firmware
         uses: actions/upload-artifact@v3
         with:
           name: OpenWrt_firmware
-          path: ./bin/targets/
+          path: ./bin/targets/x86/64/openwrt-x86-64-generic-squashfs-combined-efi.img.gz
