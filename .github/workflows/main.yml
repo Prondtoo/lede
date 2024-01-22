@@ -46,7 +46,7 @@ jobs:
         uses: klever1988/cachewrtbuild@main
         with:
           ccache: 'true'
-          prefix: ${{ github.workspace }}
+          prefix: '.'
 
       - name: Update feeds
         run: |
