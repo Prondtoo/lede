@@ -94,3 +94,14 @@ jobs:
         with:
           name: OpenWrt_firmware
           path: ./bin/targets/x86/64/openwrt-x86-64-generic-squashfs-combined-efi.img.gz
+          
+      - name: Upload Release Asset
+        id: upload-release-asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ./bin/targets/x86/64/openwrt-x86-64-generic-squashfs-combined-efi.img.gz  # Replace with the path to your actual build file
+          asset_name: openwrt-x86-64-generic-squashfs-combined-efi.img.gz # Replace with the desired name for the uploaded file
+          asset_content_type: application/zip
