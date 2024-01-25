@@ -54,6 +54,10 @@ jobs:
           echo "src-git small https://github.com/kenzok8/small" >> ./feeds.conf.default
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+
+      - name: Use 6.6 kernel
+        run: |
+          sed -i 's/KERNEL_PATCHVER:=6.1/KERNEL_PATCHVER:=6.6/' ~/lede/target/linux/x86/Makefile
           
       - name: Download config file
         run: |
