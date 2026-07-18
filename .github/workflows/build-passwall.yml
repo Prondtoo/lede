@@ -1,0 +1,362 @@
+#
+# Build luci-app-passwall IPKs for Aliyun AP8220
+# Target : qualcommax/ipq807x (aarch64_cortex-a53)
+# Sources: Openwrt-Passwall/openwrt-passwall + openwrt-passwall-packages
+#
+name: Build luci-app-passwall
+
+on:
+  workflow_dispatch:
+    inputs:
+      passwall_ref:
+        description: "openwrt-passwall branch/tag/commit (default: main)"
+        required: false
+        default: "main"
+      packages_ref:
+        description: "openwrt-passwall-packages branch/tag/commit (default: main)"
+        required: false
+        default: "main"
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/build-passwall.yml"
+
+permissions:
+  contents: write
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  TZ: Asia/Shanghai
+  TARGET_BOARD: qualcommax
+  TARGET_SUBTARGET: ipq807x
+  TARGET_DEVICE: aliyun_ap8220
+  PKG_ARCH: aarch64_cortex-a53
+
+jobs:
+  build:
+    name: Build passwall IPK (AP8220)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Install build dependencies
+        run: |
+          sudo -E apt-mark hold grub-efi-amd64-signed || true
+          sudo -E apt-get update
+          sudo -E apt-get -y install \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+            build-essential bzip2 ccache clang cmake cpio curl \
+            device-tree-compiler flex gawk gcc-multilib g++-multilib gettext \
+            genisoimage git gperf haveged help2man intltool libc6-dev-i386 \
+            libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev \
+            libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev \
+            libpython3-dev libreadline-dev libssl-dev libtool llvm lrzsz \
+            msmtp ninja-build p7zip p7zip-full patch pkgconf python3 \
+            python3-pyelftools python3-setuptools qemu-utils rsync scons \
+            squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip \
+            vim wget xmlto xxd zip zlib1g-dev zstd
+          sudo -E timedatectl set-timezone "$TZ"
+          df -h
+
+      - name: Checkout LEDE source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Add Passwall feeds
+        run: |
+          PASSWALL_REF="${{ github.event.inputs.passwall_ref || 'main' }}"
+          PACKAGES_REF="${{ github.event.inputs.packages_ref || 'main' }}"
+
+          # OpenWrt feed syntax: url;branch  or  url^commit
+          feed_line() {
+            local name="$1" url="$2" ref="$3"
+            if [[ "$ref" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+              echo "src-git ${name} ${url}^${ref}"
+            else
+              echo "src-git ${name} ${url};${ref}"
+            fi
+          }
+
+          {
+            feed_line passwall_packages \
+              "https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git" \
+              "$PACKAGES_REF"
+            feed_line passwall \
+              "https://github.com/Openwrt-Passwall/openwrt-passwall.git" \
+              "$PASSWALL_REF"
+          } >> feeds.conf.default
+
+          echo "==== feeds.conf.default ===="
+          cat feeds.conf.default
+
+      - name: Update and install feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          ./scripts/feeds install -a -f -p passwall_packages || true
+          ./scripts/feeds install -a -f -p passwall || true
+          ./scripts/feeds install luci-app-passwall
+
+          echo "==== passwall package paths ===="
+          ls -d package/feeds/passwall*/* 2>/dev/null | head -80 || true
+
+      - name: Generate .config (AP8220 + passwall)
+        run: |
+          cat > .config << 'EOF'
+          # ---- Target: Aliyun AP8220 (IPQ8071 / aarch64_cortex-a53) ----
+          CONFIG_TARGET_qualcommax=y
+          CONFIG_TARGET_qualcommax_ipq807x=y
+          CONFIG_TARGET_qualcommax_ipq807x_DEVICE_aliyun_ap8220=y
+
+          # Language
+          CONFIG_LUCI_LANG_zh_Hans=y
+
+          # ---- luci-app-passwall + aarch64-friendly defaults ----
+          CONFIG_PACKAGE_luci-app-passwall=y
+          CONFIG_PACKAGE_luci-i18n-passwall-zh-cn=y
+
+          # Prefer nftables transparent proxy (firewall4)
+          # CONFIG_PACKAGE_luci-app-passwall_Iptables_Transparent_Proxy is not set
+          CONFIG_PACKAGE_luci-app-passwall_Nftables_Transparent_Proxy=y
+
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Geoview=y
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Haproxy=y
+          # CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Hysteria is not set
+          # CONFIG_PACKAGE_luci-app-passwall_INCLUDE_NaiveProxy is not set
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Shadowsocks_Rust_Client=y
+          # CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Shadowsocks_Rust_Server is not set
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_ShadowsocksR_Libev_Client=y
+          # CONFIG_PACKAGE_luci-app-passwall_INCLUDE_ShadowsocksR_Libev_Server is not set
+          # CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Shadow_TLS is not set
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Simple_Obfs=y
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_SingBox=y
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_V2ray_Geodata=y
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_V2ray_Plugin=y
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray=y
+          # CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray_Plugin is not set
+
+          # Explicit packages from passwall feeds / LUCI_DEPENDS
+          CONFIG_PACKAGE_chinadns-ng=y
+          CONFIG_PACKAGE_dns2socks=y
+          CONFIG_PACKAGE_ipt2socks=y
+          CONFIG_PACKAGE_microsocks=y
+          CONFIG_PACKAGE_tcping=y
+          CONFIG_PACKAGE_geoview=y
+          CONFIG_PACKAGE_xray-core=y
+          CONFIG_PACKAGE_sing-box=y
+          CONFIG_PACKAGE_shadowsocks-rust-sslocal=y
+          CONFIG_PACKAGE_shadowsocksr-libev-ssr-local=y
+          CONFIG_PACKAGE_shadowsocksr-libev-ssr-redir=y
+          CONFIG_PACKAGE_simple-obfs-client=y
+          CONFIG_PACKAGE_v2ray-plugin=y
+          CONFIG_PACKAGE_v2ray-geoip=y
+          CONFIG_PACKAGE_v2ray-geosite=y
+          CONFIG_PACKAGE_haproxy=y
+          EOF
+
+          # Strip leading whitespace introduced by the YAML block
+          sed -i 's/^[[:space:]]*//' .config
+
+          make defconfig
+
+          echo "==== selected target / passwall options ===="
+          grep -E 'CONFIG_TARGET_qualcommax|DEVICE_aliyun|CONFIG_PACKAGE_luci-app-passwall|CONFIG_PACKAGE_xray|CONFIG_PACKAGE_sing-box|CONFIG_PACKAGE_chinadns' .config || true
+
+      - name: Download package sources
+        run: |
+          make download -j8
+          # Drop truncated downloads so make can retry later if needed
+          find dl -type f -size -1024c -print -delete || true
+
+      - name: Compile luci-app-passwall and dependencies
+        run: |
+          set -o pipefail
+
+          compile_pkg() {
+            local target="$1"
+            echo "==== compile: ${target} ===="
+            make -j"$(nproc)" "${target}" \
+              || make -j1 V=s "${target}"
+          }
+
+          # Main LuCI app (pulls declared DEPENDS; toolchain built as needed)
+          if [ -d package/feeds/passwall/luci-app-passwall ]; then
+            compile_pkg package/feeds/passwall/luci-app-passwall/compile
+          else
+            echo "ERROR: luci-app-passwall not found under package/feeds/passwall"
+            find package/feeds -maxdepth 3 -type d -name 'luci-app-passwall' || true
+            exit 1
+          fi
+
+          # Companion packages from openwrt-passwall-packages
+          for pkg in \
+            chinadns-ng dns2socks ipt2socks microsocks tcping geoview \
+            xray-core sing-box shadowsocks-rust shadowsocksr-libev \
+            simple-obfs v2ray-plugin v2ray-geodata
+          do
+            if [ -d "package/feeds/passwall_packages/${pkg}" ]; then
+              compile_pkg "package/feeds/passwall_packages/${pkg}/compile" \
+                || echo "WARN: ${pkg} compile failed (optional / may already exist)"
+            else
+              echo "SKIP: package/feeds/passwall_packages/${pkg} not present"
+            fi
+          done
+
+          df -h
+          echo "==== produced IPKs (sample) ===="
+          find bin/packages bin/targets -type f -name '*.ipk' 2>/dev/null | head -120 || true
+
+      - name: Collect IPK artifacts
+        id: collect
+        run: |
+          OUT="passwall-ipk-${PKG_ARCH}-ap8220"
+          mkdir -p "$OUT"/{passwall,passwall_packages,kmods,other,all}
+
+          # Passwall LuCI feed
+          if [ -d "bin/packages/${PKG_ARCH}/passwall" ]; then
+            cp -a bin/packages/${PKG_ARCH}/passwall/*.ipk "$OUT/passwall/" 2>/dev/null || true
+          fi
+
+          # Passwall packages feed
+          if [ -d "bin/packages/${PKG_ARCH}/passwall_packages" ]; then
+            cp -a bin/packages/${PKG_ARCH}/passwall_packages/*.ipk "$OUT/passwall_packages/" 2>/dev/null || true
+          fi
+
+          # nft/ipt kmods (only installable if device kernel matches this build)
+          KMOD_DIR="bin/targets/${TARGET_BOARD}/${TARGET_SUBTARGET}/packages"
+          if [ -d "$KMOD_DIR" ]; then
+            shopt -s nullglob
+            for f in \
+              "$KMOD_DIR"/kmod-nft-*.ipk \
+              "$KMOD_DIR"/kmod-nf-reject*.ipk \
+              "$KMOD_DIR"/kmod-ipt-*.ipk
+            do
+              cp -a "$f" "$OUT/kmods/"
+            done
+            shopt -u nullglob
+          fi
+
+          # Common base/luci helpers that may have been built as deps
+          for feed in base packages luci routing; do
+            dir="bin/packages/${PKG_ARCH}/${feed}"
+            [ -d "$dir" ] || continue
+            shopt -s nullglob
+            for name in \
+              haproxy curl coreutils coreutils-base64 coreutils-nohup \
+              coreutils-timeout ip-full resolveip lyaml luci-compat \
+              luci-lib-jsonc unzip dnsmasq-full
+            do
+              for f in "$dir"/${name}_*.ipk "$dir"/${name}*.ipk; do
+                [ -f "$f" ] && cp -a "$f" "$OUT/other/"
+              done
+            done
+            shopt -u nullglob
+          done
+
+          # Flat directory for easy opkg install
+          find "$OUT/passwall" "$OUT/passwall_packages" "$OUT/kmods" "$OUT/other" \
+            -type f -name '*.ipk' -exec cp -a {} "$OUT/all/" \;
+
+          {
+            echo "# luci-app-passwall IPK build"
+            echo
+            echo "- Target board: \`${TARGET_BOARD}/${TARGET_SUBTARGET}\`"
+            echo "- Device: \`${TARGET_DEVICE}\` (Aliyun AP8220)"
+            echo "- Package arch: \`${PKG_ARCH}\`"
+            echo "- LEDE commit: \`$(git rev-parse --short HEAD)\`"
+            echo "- Build time (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo "## Packages (\`all/\`)"
+            echo '```'
+            ls -lh "$OUT/all" | sed '1d' || true
+            echo '```'
+            echo
+            echo "## Install on device"
+            echo '```sh'
+            echo "# 1) Upload all/*.ipk to the router (e.g. /tmp/passwall)"
+            echo "cd /tmp/passwall"
+            echo "opkg update"
+            echo "opkg install ./*.ipk"
+            echo '```'
+            echo
+            echo "Notes:"
+            echo "- \`luci-app-passwall\` is \`PKGARCH=all\` (arch-independent)."
+            echo "- Binary deps (xray, sing-box, …) are built for \`${PKG_ARCH}\`."
+            echo "- Files under \`kmods/\` need a **matching kernel** (same LEDE tree as the running firmware)."
+          } | tee "$OUT/README.md"
+
+          COUNT=$(find "$OUT/all" -type f -name '*.ipk' | wc -l | tr -d ' ')
+          echo "ipk_count=${COUNT}" >> "$GITHUB_OUTPUT"
+          echo "out_dir=${OUT}" >> "$GITHUB_OUTPUT"
+          echo "Found ${COUNT} ipk file(s)"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "ERROR: no IPK produced"
+            find bin -name '*.ipk' 2>/dev/null | head -200 || true
+            exit 1
+          fi
+
+          if ! ls "$OUT/all"/luci-app-passwall_*.ipk >/dev/null 2>&1; then
+            echo "ERROR: luci-app-passwall_*.ipk not found"
+            find bin -name '*passwall*.ipk' 2>/dev/null || true
+            exit 1
+          fi
+
+          tar -czf "${OUT}.tar.gz" "$OUT"
+          zip -r "${OUT}.zip" "$OUT"
+          ls -lh "${OUT}.tar.gz" "${OUT}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.collect.outputs.out_dir }}
+          path: |
+            ${{ steps.collect.outputs.out_dir }}.tar.gz
+            ${{ steps.collect.outputs.out_dir }}.zip
+            ${{ steps.collect.outputs.out_dir }}/README.md
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: passwall-${{ github.run_number }}-${{ env.PKG_ARCH }}
+          name: "luci-app-passwall for AP8220 (${{ env.PKG_ARCH }}) #${{ github.run_number }}"
+          body: |
+            Automated build of **luci-app-passwall** and required dependencies.
+
+            | Item | Value |
+            | --- | --- |
+            | Device | Aliyun AP8220 |
+            | Target | `${{ env.TARGET_BOARD }}/${{ env.TARGET_SUBTARGET }}` |
+            | Arch | `${{ env.PKG_ARCH }}` |
+            | LEDE | `${{ github.sha }}` |
+            | Workflow run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
+
+            Download the `.zip` / `.tar.gz`, extract, copy `all/*.ipk` to the router and run:
+
+            ```sh
+            opkg update
+            opkg install ./*.ipk
+            ```
+
+            IPK count: **${{ steps.collect.outputs.ipk_count }}**
+          files: |
+            ${{ steps.collect.outputs.out_dir }}.tar.gz
+            ${{ steps.collect.outputs.out_dir }}.zip
+          draft: false
+          prerelease: false
+          generate_release_notes: false
