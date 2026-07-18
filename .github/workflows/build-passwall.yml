@@ -698,8 +698,8 @@ jobs:
   # Drop the temporary bulk staging artifact so Artifacts only lists each IPK.
   cleanup-staging:
     name: Cleanup staging artifact
-    needs: publish-ipk-artifacts
-    if: always() && needs.build.result == 'success'
+    needs: [build, publish-ipk-artifacts]
+    if: ${{ always() && needs.build.result == 'success' }}
     runs-on: ubuntu-22.04
     steps:
       - name: Delete passwall-dist-staging
