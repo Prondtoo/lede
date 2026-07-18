@@ -1,7 +1,11 @@
 #
 # Build luci-app-passwall IPKs for Aliyun AP8220
 # Target : qualcommax/ipq807x (aarch64_cortex-a53)
-# Sources: Openwrt-Passwall/openwrt-passwall + openwrt-passwall-packages
+#
+# Passwall sources (ONLY):
+#   - https://github.com/Openwrt-Passwall/openwrt-passwall
+#   - https://github.com/Openwrt-Passwall/openwrt-passwall-packages
+# Stock LEDE/coolsnowwolf copies of the same package names are purged.
 #
 name: Build luci-app-passwall
 
@@ -16,6 +20,10 @@ on:
         description: "openwrt-passwall-packages branch/tag/commit (default: main)"
         required: false
         default: "main"
+      no_cache:
+        description: "Skip restore/save cache (true/false)"
+        required: false
+        default: "false"
   push:
     branches:
       - master
@@ -32,6 +40,8 @@ env:
   TARGET_SUBTARGET: ipq807x
   TARGET_DEVICE: aliyun_ap8220
   PKG_ARCH: aarch64_cortex-a53
+  # Cache paths (relative to workspace / LEDE root)
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
 
 jobs:
   build:
@@ -68,6 +78,7 @@ jobs:
             squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip \
             vim wget xmlto xxd zip zlib1g-dev zstd
           sudo -E timedatectl set-timezone "$TZ"
+          ccache -V || true
           df -h
 
       - name: Checkout LEDE source
@@ -75,10 +86,48 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Add Passwall feeds
+      - name: Resolve feed refs
+        id: refs
         run: |
-          PASSWALL_REF="${{ github.event.inputs.passwall_ref || 'main' }}"
-          PACKAGES_REF="${{ github.event.inputs.packages_ref || 'main' }}"
+          echo "passwall_ref=${{ github.event.inputs.passwall_ref || 'main' }}" >> "$GITHUB_OUTPUT"
+          echo "packages_ref=${{ github.event.inputs.packages_ref || 'main' }}" >> "$GITHUB_OUTPUT"
+          echo "lede_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "lede_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------------
+      # Cache: download mirror (dl), host tools, cross toolchain, ccache.
+      # Secondary builds with the same LEDE + passwall refs restore quickly.
+      # ------------------------------------------------------------------
+      - name: Restore build cache
+        if: ${{ github.event.inputs.no_cache != 'true' }}
+        uses: actions/cache/restore@v4
+        id: cache
+        with:
+          path: |
+            dl
+            staging_dir/host
+            staging_dir/toolchain-*
+            build_dir/host
+            .ccache
+          key: passwall-${{ runner.os }}-${{ env.PKG_ARCH }}-lede-${{ steps.refs.outputs.lede_sha }}-pw-${{ steps.refs.outputs.passwall_ref }}-pkgs-${{ steps.refs.outputs.packages_ref }}
+          restore-keys: |
+            passwall-${{ runner.os }}-${{ env.PKG_ARCH }}-lede-${{ steps.refs.outputs.lede_sha }}-
+            passwall-${{ runner.os }}-${{ env.PKG_ARCH }}-
+
+      - name: Prepare ccache
+        run: |
+          mkdir -p "$CCACHE_DIR"
+          ccache -o cache_dir="$CCACHE_DIR"
+          ccache -o max_size=2G
+          ccache -o compression=true
+          ccache -z || true
+          echo "==== ccache before build ===="
+          ccache -s || true
+
+      - name: Add Openwrt-Passwall feeds only
+        run: |
+          PASSWALL_REF="${{ steps.refs.outputs.passwall_ref }}"
+          PACKAGES_REF="${{ steps.refs.outputs.packages_ref }}"
 
           # OpenWrt feed syntax: url;branch  or  url^commit
           feed_line() {
@@ -89,6 +138,9 @@ jobs:
               echo "src-git ${name} ${url};${ref}"
             fi
           }
+
+          # Strip any previous passwall feed lines, then append official ones
+          sed -i -E '/^src-git[[:space:]]+passwall(_packages)?[[:space:]]+/d' feeds.conf.default
 
           {
             feed_line passwall_packages \
@@ -102,21 +154,14 @@ jobs:
           echo "==== feeds.conf.default ===="
           cat feeds.conf.default
 
-      - name: Update and install feeds
+      - name: Update feeds and purge LEDE passwall packages
         run: |
-          ./scripts/feeds update -a
+          set -euo pipefail
 
-          # -----------------------------------------------------------------
-          # Resolve name conflicts: prefer Openwrt-Passwall over stock feeds.
-          # coolsnowwolf/luci ships an older luci-app-passwall (e.g. 26.4.x).
-          # coolsnowwolf/packages ships overlapping deps (xray-core, sing-box, …).
-          # Drop those so feeds install / -f will wire package/feeds/* to
-          # passwall + passwall_packages only.
-          # -----------------------------------------------------------------
-          echo "==== remove conflicting packages from luci / packages feeds ===="
-          rm -rf feeds/luci/applications/luci-app-passwall
-          # Some luci trees use luci-app-passwall2; leave it unless it collides.
-          CONFLICT_PKGS=(
+          # Official passwall package names (openwrt-passwall + openwrt-passwall-packages)
+          # Anything with these names outside feeds/passwall{,_packages} is removed.
+          PASSWALL_NAMES=(
+            luci-app-passwall
             chinadns-ng
             dns2socks
             geoview
@@ -135,69 +180,163 @@ jobs:
             xray-core
             xray-plugin
           )
-          for pkg in "${CONFLICT_PKGS[@]}"; do
-            rm -rf "feeds/packages/net/${pkg}"
-            rm -rf "feeds/packages/utils/${pkg}"
-            rm -rf "feeds/packages/lang/${pkg}"
-          done
 
-          # Rebuild feed indexes so deleted packages are gone from the catalog
+          is_official_passwall_path() {
+            case "$1" in
+              feeds/passwall/*|feeds/passwall_packages/*|package/feeds/passwall/*|package/feeds/passwall_packages/*)
+                return 0
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+          }
+
+          purge_lede_passwall() {
+            local root="$1"   # feeds or package/feeds
+            echo "---- purge under ${root} ----"
+            # Remove known names from every feed except passwall / passwall_packages
+            if [ -d "$root" ]; then
+              for feeddir in "$root"/*; do
+                [ -d "$feeddir" ] || continue
+                base="$(basename "$feeddir")"
+                case "$base" in
+                  passwall|passwall_packages) continue ;;
+                esac
+                for name in "${PASSWALL_NAMES[@]}"; do
+                  # Common layouts: applications/luci-app-passwall, net/xray-core, or flat
+                  rm -rf \
+                    "${feeddir}/${name}" \
+                    "${feeddir}/applications/${name}" \
+                    "${feeddir}/net/${name}" \
+                    "${feeddir}/utils/${name}" \
+                    "${feeddir}/lang/${name}" \
+                    "${feeddir}/libs/${name}"
+                done
+              done
+            fi
+
+            # Belt-and-suspenders: find by directory name anywhere under root
+            if [ -d "$root" ]; then
+              while IFS= read -r -d '' d; do
+                rel="${d#./}"
+                if is_official_passwall_path "$rel"; then
+                  continue
+                fi
+                echo "REMOVE $rel"
+                rm -rf "$d"
+              done < <(
+                find "$root" -type d \( \
+                  -name 'luci-app-passwall' -o \
+                  -name 'chinadns-ng' -o \
+                  -name 'dns2socks' -o \
+                  -name 'geoview' -o \
+                  -name 'hysteria' -o \
+                  -name 'ipt2socks' -o \
+                  -name 'microsocks' -o \
+                  -name 'naiveproxy' -o \
+                  -name 'shadow-tls' -o \
+                  -name 'shadowsocks-rust' -o \
+                  -name 'shadowsocksr-libev' -o \
+                  -name 'simple-obfs' -o \
+                  -name 'sing-box' -o \
+                  -name 'tcping' -o \
+                  -name 'v2ray-geodata' -o \
+                  -name 'v2ray-plugin' -o \
+                  -name 'xray-core' -o \
+                  -name 'xray-plugin' \
+                \) -print0 2>/dev/null
+              )
+            fi
+          }
+
+          echo "==== feeds update ===="
+          ./scripts/feeds update -a
+
+          echo "==== purge LEDE/coolsnowwolf passwall packages from feed trees ===="
+          purge_lede_passwall feeds
+
+          # Rebuild indexes without the purged packages
           ./scripts/feeds update -i
 
-          # Install base feeds (luci/packages/… without the removed names)
+          echo "==== install stock feeds (no passwall names left) ===="
           ./scripts/feeds install -a
 
-          # Force-link Openwrt-Passwall feeds last so they own the package names
+          echo "==== force-install Openwrt-Passwall feeds ===="
           ./scripts/feeds install -a -f -p passwall_packages
           ./scripts/feeds install -a -f -p passwall
           ./scripts/feeds install -f luci-app-passwall
 
-          # Safety: purge any leftover install links still pointing at luci/packages
-          rm -rf package/feeds/luci/luci-app-passwall
-          for pkg in "${CONFLICT_PKGS[@]}"; do
-            if [ -e "package/feeds/packages/${pkg}" ]; then
-              target="$(readlink -f "package/feeds/packages/${pkg}" 2>/dev/null || true)"
-              case "$target" in
-                */feeds/passwall_packages/*) ;; # keep if somehow linked correctly
-                *)
-                  echo "remove residual package/feeds/packages/${pkg} -> ${target:-n/a}"
-                  rm -rf "package/feeds/packages/${pkg}"
-                  ;;
-              esac
-            fi
-          done
+          echo "==== purge any residual package/feeds links outside passwall* ===="
+          purge_lede_passwall package/feeds
 
-          # Re-force after cleanup so package/feeds/passwall* is complete
+          # Re-force so package/feeds/passwall* is complete after purge
           ./scripts/feeds install -a -f -p passwall_packages
           ./scripts/feeds install -a -f -p passwall
 
-          echo "==== verify luci-app-passwall source (expect passwall feed / 26.x new) ===="
+          echo "==== HARD VERIFY: only Openwrt-Passwall sources ===="
           if [ ! -d package/feeds/passwall/luci-app-passwall ]; then
-            echo "ERROR: luci-app-passwall not installed from passwall feed"
-            find package/feeds -maxdepth 3 -type d -name 'luci-app-passwall' || true
+            echo "ERROR: package/feeds/passwall/luci-app-passwall missing"
+            find package feeds -type d -name 'luci-app-passwall' 2>/dev/null || true
             exit 1
           fi
-          if [ -e package/feeds/luci/luci-app-passwall ]; then
-            echo "ERROR: stale luci feed luci-app-passwall still present"
-            ls -la package/feeds/luci/luci-app-passwall
-            exit 1
-          fi
-          echo "-- Makefile from package/feeds/passwall/luci-app-passwall --"
-          grep -E '^PKG_(NAME|VERSION|RELEASE)' package/feeds/passwall/luci-app-passwall/Makefile || true
-          echo "-- passwall package paths --"
-          ls -d package/feeds/passwall/* package/feeds/passwall_packages/* 2>/dev/null | head -80 || true
-          echo "-- ensure key deps resolve to passwall_packages --"
-          for pkg in xray-core sing-box chinadns-ng; do
-            if [ -e "package/feeds/passwall_packages/${pkg}" ]; then
-              echo "OK  passwall_packages/${pkg}"
-              grep -E '^PKG_(NAME|VERSION)' "package/feeds/passwall_packages/${pkg}/Makefile" | head -5 || true
-            else
-              echo "WARN missing passwall_packages/${pkg}"
+
+          # No luci-app-passwall outside official feed
+          while IFS= read -r d; do
+            case "$d" in
+              package/feeds/passwall/luci-app-passwall|feeds/passwall/luci-app-passwall) ;;
+              *)
+                echo "ERROR: extra luci-app-passwall at $d"
+                exit 1
+                ;;
+            esac
+          done < <(find package feeds -type d -name 'luci-app-passwall' 2>/dev/null)
+
+          for name in xray-core sing-box chinadns-ng dns2socks ipt2socks microsocks \
+                      tcping geoview shadowsocks-rust shadowsocksr-libev simple-obfs \
+                      v2ray-plugin v2ray-geodata; do
+            # Must exist under passwall_packages
+            if [ ! -e "package/feeds/passwall_packages/${name}" ] && \
+               [ ! -e "feeds/passwall_packages/${name}" ]; then
+              echo "WARN: ${name} not found under passwall_packages (may be optional)"
             fi
-            if [ -e "package/feeds/packages/${pkg}" ]; then
-              echo "WARN residual packages/${pkg} still exists -> $(readlink -f package/feeds/packages/${pkg} 2>/dev/null || echo not-a-link)"
+            # Must NOT exist under other feeds
+            while IFS= read -r d; do
+              case "$d" in
+                package/feeds/passwall_packages/*|feeds/passwall_packages/*|package/feeds/passwall/*|feeds/passwall/*) ;;
+                *)
+                  echo "ERROR: LEDE copy of ${name} still present: $d"
+                  exit 1
+                  ;;
+              esac
+            done < <(find package/feeds feeds -type d -name "${name}" 2>/dev/null)
+          done
+
+          echo "-- luci-app-passwall Makefile (must be Openwrt-Passwall) --"
+          grep -E '^PKG_(NAME|VERSION|RELEASE)|^# Copyright' \
+            package/feeds/passwall/luci-app-passwall/Makefile | head -20
+          real="$(readlink -f package/feeds/passwall/luci-app-passwall || true)"
+          echo "realpath: ${real}"
+          case "${real}" in
+            */feeds/passwall/*) echo "OK source tree is feeds/passwall" ;;
+            *)
+              echo "ERROR: luci-app-passwall does not resolve into feeds/passwall"
+              exit 1
+              ;;
+          esac
+
+          echo "-- key dep versions from passwall_packages --"
+          for name in xray-core sing-box chinadns-ng; do
+            mk="package/feeds/passwall_packages/${name}/Makefile"
+            if [ -f "$mk" ]; then
+              echo "[${name}]"
+              grep -E '^PKG_(NAME|VERSION|RELEASE)' "$mk" | head -5
+              echo "  -> $(readlink -f "package/feeds/passwall_packages/${name}")"
             fi
           done
+
+          echo "-- package/feeds tree (passwall*) --"
+          ls -la package/feeds/passwall package/feeds/passwall_packages 2>/dev/null | head -100
 
       - name: Generate .config (AP8220 + passwall)
         run: |
@@ -207,10 +346,14 @@ jobs:
           CONFIG_TARGET_qualcommax_ipq807x=y
           CONFIG_TARGET_qualcommax_ipq807x_DEVICE_aliyun_ap8220=y
 
+          # ccache for faster rebuilds
+          CONFIG_DEVEL=y
+          CONFIG_CCACHE=y
+
           # Language
           CONFIG_LUCI_LANG_zh_Hans=y
 
-          # ---- luci-app-passwall + aarch64-friendly defaults ----
+          # ---- luci-app-passwall (Openwrt-Passwall) + aarch64 defaults ----
           CONFIG_PACKAGE_luci-app-passwall=y
           CONFIG_PACKAGE_luci-i18n-passwall-zh-cn=y
 
@@ -234,7 +377,7 @@ jobs:
           CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray=y
           # CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray_Plugin is not set
 
-          # Explicit packages from passwall feeds / LUCI_DEPENDS
+          # Explicit packages from openwrt-passwall-packages
           CONFIG_PACKAGE_chinadns-ng=y
           CONFIG_PACKAGE_dns2socks=y
           CONFIG_PACKAGE_ipt2socks=y
@@ -253,23 +396,27 @@ jobs:
           CONFIG_PACKAGE_haproxy=y
           EOF
 
-          # Strip leading whitespace introduced by the YAML block
           sed -i 's/^[[:space:]]*//' .config
-
           make defconfig
 
+          # Point OpenWrt ccache at our cached directory
+          if grep -q '^CONFIG_CCACHE=y' .config; then
+            echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          fi
+
           echo "==== selected target / passwall options ===="
-          grep -E 'CONFIG_TARGET_qualcommax|DEVICE_aliyun|CONFIG_PACKAGE_luci-app-passwall|CONFIG_PACKAGE_xray|CONFIG_PACKAGE_sing-box|CONFIG_PACKAGE_chinadns' .config || true
+          grep -E 'CONFIG_TARGET_qualcommax|DEVICE_aliyun|CONFIG_CCACHE|CONFIG_PACKAGE_luci-app-passwall|CONFIG_PACKAGE_xray|CONFIG_PACKAGE_sing-box|CONFIG_PACKAGE_chinadns' .config || true
 
       - name: Download package sources
         run: |
           make download -j8
-          # Drop truncated downloads so make can retry later if needed
           find dl -type f -size -1024c -print -delete || true
+          echo "==== dl size ===="
+          du -sh dl 2>/dev/null || true
 
-      - name: Compile luci-app-passwall and dependencies
+      - name: Compile luci-app-passwall and Openwrt-Passwall deps only
         run: |
-          set -o pipefail
+          set -euo pipefail
 
           compile_pkg() {
             local target="$1"
@@ -278,16 +425,14 @@ jobs:
               || make -j1 V=s "${target}"
           }
 
-          # Main LuCI app (pulls declared DEPENDS; toolchain built as needed)
-          if [ -d package/feeds/passwall/luci-app-passwall ]; then
-            compile_pkg package/feeds/passwall/luci-app-passwall/compile
-          else
-            echo "ERROR: luci-app-passwall not found under package/feeds/passwall"
-            find package/feeds -maxdepth 3 -type d -name 'luci-app-passwall' || true
+          # Main app — must be the Openwrt-Passwall feed copy
+          if [ ! -d package/feeds/passwall/luci-app-passwall ]; then
+            echo "ERROR: package/feeds/passwall/luci-app-passwall missing"
             exit 1
           fi
+          compile_pkg package/feeds/passwall/luci-app-passwall/compile
 
-          # Companion packages from openwrt-passwall-packages
+          # All companion packages from openwrt-passwall-packages (not LEDE packages feed)
           for pkg in \
             chinadns-ng dns2socks ipt2socks microsocks tcping geoview \
             xray-core sing-box shadowsocks-rust shadowsocksr-libev \
@@ -301,6 +446,8 @@ jobs:
             fi
           done
 
+          echo "==== ccache after build ===="
+          ccache -s || true
           df -h
           echo "==== produced IPKs (sample) ===="
           find bin/packages bin/targets -type f -name '*.ipk' 2>/dev/null | head -120 || true
@@ -311,17 +458,15 @@ jobs:
           OUT="passwall-ipk-${PKG_ARCH}-ap8220"
           mkdir -p "$OUT"/{passwall,passwall_packages,kmods,other,all}
 
-          # Passwall LuCI feed
+          # ONLY collect from Openwrt-Passwall feed output dirs first
           if [ -d "bin/packages/${PKG_ARCH}/passwall" ]; then
             cp -a bin/packages/${PKG_ARCH}/passwall/*.ipk "$OUT/passwall/" 2>/dev/null || true
           fi
-
-          # Passwall packages feed
           if [ -d "bin/packages/${PKG_ARCH}/passwall_packages" ]; then
             cp -a bin/packages/${PKG_ARCH}/passwall_packages/*.ipk "$OUT/passwall_packages/" 2>/dev/null || true
           fi
 
-          # nft/ipt kmods (only installable if device kernel matches this build)
+          # nft/ipt kmods (kernel-matched; optional)
           KMOD_DIR="bin/targets/${TARGET_BOARD}/${TARGET_SUBTARGET}/packages"
           if [ -d "$KMOD_DIR" ]; then
             shopt -s nullglob
@@ -335,7 +480,8 @@ jobs:
             shopt -u nullglob
           fi
 
-          # Common base/luci helpers that may have been built as deps
+          # Generic system helpers that are NOT passwall-specific (curl, etc.)
+          # These legitimately come from LEDE base/packages feeds.
           for feed in base packages luci routing; do
             dir="bin/packages/${PKG_ARCH}/${feed}"
             [ -d "$dir" ] || continue
@@ -345,14 +491,26 @@ jobs:
               coreutils-timeout ip-full resolveip lyaml luci-compat \
               luci-lib-jsonc unzip dnsmasq-full
             do
-              for f in "$dir"/${name}_*.ipk "$dir"/${name}*.ipk; do
+              for f in "$dir"/${name}_*.ipk; do
                 [ -f "$f" ] && cp -a "$f" "$OUT/other/"
               done
             done
             shopt -u nullglob
           done
 
-          # Flat directory for easy opkg install
+          # Refuse to ship LEDE copies of passwall-named IPKs from packages/luci feeds
+          shopt -s nullglob
+          for feed in packages luci; do
+            dir="bin/packages/${PKG_ARCH}/${feed}"
+            [ -d "$dir" ] || continue
+            for name in luci-app-passwall xray-core sing-box chinadns-ng; do
+              for f in "$dir"/${name}*.ipk; do
+                echo "NOTE: ignoring non-passwall-feed IPK $f (should not be used)"
+              done
+            done
+          done
+          shopt -u nullglob
+
           find "$OUT/passwall" "$OUT/passwall_packages" "$OUT/kmods" "$OUT/other" \
             -type f -name '*.ipk' -exec cp -a {} "$OUT/all/" \;
 
@@ -362,8 +520,15 @@ jobs:
             echo "- Target board: \`${TARGET_BOARD}/${TARGET_SUBTARGET}\`"
             echo "- Device: \`${TARGET_DEVICE}\` (Aliyun AP8220)"
             echo "- Package arch: \`${PKG_ARCH}\`"
-            echo "- LEDE commit: \`$(git rev-parse --short HEAD)\`"
+            echo "- LEDE commit: \`${{ steps.refs.outputs.lede_short }}\`"
+            echo "- passwall ref: \`${{ steps.refs.outputs.passwall_ref }}\`"
+            echo "- passwall-packages ref: \`${{ steps.refs.outputs.packages_ref }}\`"
             echo "- Build time (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "- Cache restored: \`${{ steps.cache.outputs.cache-hit || 'n/a' }}\`"
+            echo
+            echo "## Source policy"
+            echo "- \`luci-app-passwall\` and proxy deps: **Openwrt-Passwall only**"
+            echo "- LEDE/coolsnowwolf duplicates of the same names are purged before build"
             echo
             echo "## Packages (\`all/\`)"
             echo '```'
@@ -372,16 +537,10 @@ jobs:
             echo
             echo "## Install on device"
             echo '```sh'
-            echo "# 1) Upload all/*.ipk to the router (e.g. /tmp/passwall)"
             echo "cd /tmp/passwall"
             echo "opkg update"
             echo "opkg install ./*.ipk"
             echo '```'
-            echo
-            echo "Notes:"
-            echo "- \`luci-app-passwall\` is \`PKGARCH=all\` (arch-independent)."
-            echo "- Binary deps (xray, sing-box, …) are built for \`${PKG_ARCH}\`."
-            echo "- Files under \`kmods/\` need a **matching kernel** (same LEDE tree as the running firmware)."
           } | tee "$OUT/README.md"
 
           COUNT=$(find "$OUT/all" -type f -name '*.ipk' | wc -l | tr -d ' ')
@@ -401,9 +560,28 @@ jobs:
             exit 1
           fi
 
+          # Sanity: primary IPK should live under the passwall feed output
+          if ! ls "$OUT/passwall"/luci-app-passwall_*.ipk >/dev/null 2>&1; then
+            echo "WARN: luci-app-passwall not under passwall/ feed output (check packaging feed name)"
+            ls -la "$OUT/passwall" "$OUT/all" || true
+          fi
+
           tar -czf "${OUT}.tar.gz" "$OUT"
           zip -r "${OUT}.zip" "$OUT"
           ls -lh "${OUT}.tar.gz" "${OUT}.zip"
+
+      # Only save when there was no exact key hit (save fails if key already exists)
+      - name: Save build cache
+        if: ${{ always() && github.event.inputs.no_cache != 'true' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            dl
+            staging_dir/host
+            staging_dir/toolchain-*
+            build_dir/host
+            .ccache
+          key: passwall-${{ runner.os }}-${{ env.PKG_ARCH }}-lede-${{ steps.refs.outputs.lede_sha }}-pw-${{ steps.refs.outputs.passwall_ref }}-pkgs-${{ steps.refs.outputs.packages_ref }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -422,7 +600,9 @@ jobs:
           tag_name: passwall-${{ github.run_number }}-${{ env.PKG_ARCH }}
           name: "luci-app-passwall for AP8220 (${{ env.PKG_ARCH }}) #${{ github.run_number }}"
           body: |
-            Automated build of **luci-app-passwall** and required dependencies.
+            Automated build of **luci-app-passwall** from [Openwrt-Passwall](https://github.com/Openwrt-Passwall/openwrt-passwall) (+ [packages](https://github.com/Openwrt-Passwall/openwrt-passwall-packages)).
+
+            LEDE stock copies of the same package names are **purged** before build.
 
             | Item | Value |
             | --- | --- |
@@ -430,9 +610,11 @@ jobs:
             | Target | `${{ env.TARGET_BOARD }}/${{ env.TARGET_SUBTARGET }}` |
             | Arch | `${{ env.PKG_ARCH }}` |
             | LEDE | `${{ github.sha }}` |
+            | passwall | `${{ steps.refs.outputs.passwall_ref }}` |
+            | passwall-packages | `${{ steps.refs.outputs.packages_ref }}` |
             | Workflow run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
 
-            Download the `.zip` / `.tar.gz`, extract, copy `all/*.ipk` to the router and run:
+            Download the `.zip` / `.tar.gz`, extract, copy `all/*.ipk` to the router:
 
             ```sh
             opkg update
