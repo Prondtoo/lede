@@ -595,11 +595,32 @@ jobs:
             echo '```'
           } | tee "$DIST/README.md"
 
-          # One zip only — for Release “download all”. Artifacts are per-IPK (see next job).
+          # One zip only — flat root, no subfolders, no duplicate basenames.
+          # zip -j junks paths so entries are bare filenames (never passwall/all/...).
           ZIP="passwall-ipk-${PKG_ARCH}-ap8220.zip"
           rm -f "$ZIP"
-          (cd "$DIST" && zip -9 "../${ZIP}" ./*.ipk README.md)
+          (
+            cd "$DIST"
+            zip -9 -j "../${ZIP}" ./*.ipk README.md
+          )
           ls -lh "$ZIP"
+
+          echo "==== verify zip is flat and de-duplicated ===="
+          # No directory components allowed
+          if unzip -Z1 "$ZIP" | grep -q '/'; then
+            echo "ERROR: zip contains nested paths:"
+            unzip -Z1 "$ZIP" | grep '/' || true
+            exit 1
+          fi
+          # No duplicate basenames (should be impossible with -j + flat dist)
+          DUPES="$(unzip -Z1 "$ZIP" | sort | uniq -d || true)"
+          if [ -n "${DUPES}" ]; then
+            echo "ERROR: duplicate entries in zip:"
+            echo "${DUPES}"
+            exit 1
+          fi
+          echo "zip entries:"
+          unzip -l "$ZIP"
 
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, pathlib
