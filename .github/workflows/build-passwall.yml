@@ -48,6 +48,10 @@ jobs:
     name: Build passwall IPK (AP8220)
     runs-on: ubuntu-22.04
     timeout-minutes: 360
+    outputs:
+      ipks: ${{ steps.collect.outputs.ipk_json }}
+      ipk_count: ${{ steps.collect.outputs.ipk_count }}
+      zip_name: ${{ steps.collect.outputs.zip_name }}
 
     steps:
       - name: Free disk space
@@ -498,120 +502,112 @@ jobs:
       - name: Collect IPK artifacts
         id: collect
         run: |
-          OUT="passwall-ipk-${PKG_ARCH}-ap8220"
-          mkdir -p "$OUT"/{passwall,passwall_packages,kmods,other,all}
+          # Flat, de-duplicated IPK directory — no nested copies, no double archives.
+          DIST="dist"
+          rm -rf "$DIST"
+          mkdir -p "$DIST"
 
-          # ONLY collect from Openwrt-Passwall feed output dirs first
-          if [ -d "bin/packages/${PKG_ARCH}/passwall" ]; then
-            cp -a bin/packages/${PKG_ARCH}/passwall/*.ipk "$OUT/passwall/" 2>/dev/null || true
-          fi
-          if [ -d "bin/packages/${PKG_ARCH}/passwall_packages" ]; then
-            cp -a bin/packages/${PKG_ARCH}/passwall_packages/*.ipk "$OUT/passwall_packages/" 2>/dev/null || true
-          fi
+          add_ipk() {
+            local src="$1"
+            [ -f "$src" ] || return 0
+            local base
+            base="$(basename "$src")"
+            if [ -e "${DIST}/${base}" ]; then
+              echo "skip duplicate: ${base}"
+              return 0
+            fi
+            cp -a "$src" "${DIST}/${base}"
+            echo "add: ${base}"
+          }
+
+          # Openwrt-Passwall feeds only
+          shopt -s nullglob
+          for f in bin/packages/${PKG_ARCH}/passwall/*.ipk; do
+            add_ipk "$f"
+          done
+          for f in bin/packages/${PKG_ARCH}/passwall_packages/*.ipk; do
+            add_ipk "$f"
+          done
 
           # nft/ipt kmods (kernel-matched; optional)
           KMOD_DIR="bin/targets/${TARGET_BOARD}/${TARGET_SUBTARGET}/packages"
           if [ -d "$KMOD_DIR" ]; then
-            shopt -s nullglob
             for f in \
               "$KMOD_DIR"/kmod-nft-*.ipk \
               "$KMOD_DIR"/kmod-nf-reject*.ipk \
               "$KMOD_DIR"/kmod-ipt-*.ipk
             do
-              cp -a "$f" "$OUT/kmods/"
+              add_ipk "$f"
             done
-            shopt -u nullglob
           fi
 
-          # Generic system helpers that are NOT passwall-specific (curl, etc.)
-          # These legitimately come from LEDE base/packages feeds.
+          # Generic system helpers (not passwall-named; from LEDE base feeds)
           for feed in base packages luci routing; do
             dir="bin/packages/${PKG_ARCH}/${feed}"
             [ -d "$dir" ] || continue
-            shopt -s nullglob
             for name in \
               haproxy curl coreutils coreutils-base64 coreutils-nohup \
               coreutils-timeout ip-full resolveip lyaml luci-compat \
               luci-lib-jsonc unzip dnsmasq-full
             do
               for f in "$dir"/${name}_*.ipk; do
-                [ -f "$f" ] && cp -a "$f" "$OUT/other/"
-              done
-            done
-            shopt -u nullglob
-          done
-
-          # Refuse to ship LEDE copies of passwall-named IPKs from packages/luci feeds
-          shopt -s nullglob
-          for feed in packages luci; do
-            dir="bin/packages/${PKG_ARCH}/${feed}"
-            [ -d "$dir" ] || continue
-            for name in luci-app-passwall xray-core sing-box chinadns-ng; do
-              for f in "$dir"/${name}*.ipk; do
-                echo "NOTE: ignoring non-passwall-feed IPK $f (should not be used)"
+                add_ipk "$f"
               done
             done
           done
           shopt -u nullglob
 
-          find "$OUT/passwall" "$OUT/passwall_packages" "$OUT/kmods" "$OUT/other" \
-            -type f -name '*.ipk' -exec cp -a {} "$OUT/all/" \;
-
-          {
-            echo "# luci-app-passwall IPK build"
-            echo
-            echo "- Target board: \`${TARGET_BOARD}/${TARGET_SUBTARGET}\`"
-            echo "- Device: \`${TARGET_DEVICE}\` (Aliyun AP8220)"
-            echo "- Package arch: \`${PKG_ARCH}\`"
-            echo "- LEDE commit: \`${{ steps.refs.outputs.lede_short }}\`"
-            echo "- passwall ref: \`${{ steps.refs.outputs.passwall_ref }}\`"
-            echo "- passwall-packages ref: \`${{ steps.refs.outputs.packages_ref }}\`"
-            echo "- Build time (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "- Cache restored: \`${{ steps.cache.outputs.cache-hit || 'n/a' }}\`"
-            echo
-            echo "## Source policy"
-            echo "- \`luci-app-passwall\` and proxy deps: **Openwrt-Passwall only**"
-            echo "- LEDE/coolsnowwolf duplicates of the same names are purged before build"
-            echo
-            echo "## Packages (\`all/\`)"
-            echo '```'
-            ls -lh "$OUT/all" | sed '1d' || true
-            echo '```'
-            echo
-            echo "## Install on device"
-            echo '```sh'
-            echo "cd /tmp/passwall"
-            echo "opkg update"
-            echo "opkg install ./*.ipk"
-            echo '```'
-          } | tee "$OUT/README.md"
-
-          COUNT=$(find "$OUT/all" -type f -name '*.ipk' | wc -l | tr -d ' ')
-          echo "ipk_count=${COUNT}" >> "$GITHUB_OUTPUT"
-          echo "out_dir=${OUT}" >> "$GITHUB_OUTPUT"
-          echo "Found ${COUNT} ipk file(s)"
+          COUNT=$(find "$DIST" -maxdepth 1 -type f -name '*.ipk' | wc -l | tr -d ' ')
+          echo "Found ${COUNT} unique ipk file(s)"
+          ls -lh "$DIST" || true
 
           if [ "$COUNT" -eq 0 ]; then
             echo "ERROR: no IPK produced"
             find bin -name '*.ipk' 2>/dev/null | head -200 || true
             exit 1
           fi
-
-          if ! ls "$OUT/all"/luci-app-passwall_*.ipk >/dev/null 2>&1; then
+          if ! ls "$DIST"/luci-app-passwall_*.ipk >/dev/null 2>&1; then
             echo "ERROR: luci-app-passwall_*.ipk not found"
             find bin -name '*passwall*.ipk' 2>/dev/null || true
             exit 1
           fi
 
-          # Sanity: primary IPK should live under the passwall feed output
-          if ! ls "$OUT/passwall"/luci-app-passwall_*.ipk >/dev/null 2>&1; then
-            echo "WARN: luci-app-passwall not under passwall/ feed output (check packaging feed name)"
-            ls -la "$OUT/passwall" "$OUT/all" || true
-          fi
+          {
+            echo "# luci-app-passwall IPK build"
+            echo
+            echo "- Target: \`${TARGET_BOARD}/${TARGET_SUBTARGET}\` / \`${TARGET_DEVICE}\`"
+            echo "- Arch: \`${PKG_ARCH}\`"
+            echo "- LEDE: \`${{ steps.refs.outputs.lede_short }}\`"
+            echo "- passwall: \`${{ steps.refs.outputs.passwall_ref }}\`"
+            echo "- passwall-packages: \`${{ steps.refs.outputs.packages_ref }}\`"
+            echo "- Build time (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "- IPK count: ${COUNT}"
+            echo
+            echo "## Files"
+            echo '```'
+            ls -1 "$DIST"/*.ipk | xargs -n1 basename | sort
+            echo '```'
+            echo
+            echo "## Install"
+            echo '```sh'
+            echo "opkg update"
+            echo "opkg install ./luci-app-passwall_*.ipk   # or select packages as needed"
+            echo '```'
+          } | tee "$DIST/README.md"
 
-          tar -czf "${OUT}.tar.gz" "$OUT"
-          zip -r "${OUT}.zip" "$OUT"
-          ls -lh "${OUT}.tar.gz" "${OUT}.zip"
+          # One zip only — for Release “download all”. Artifacts are per-IPK (see next job).
+          ZIP="passwall-ipk-${PKG_ARCH}-ap8220.zip"
+          rm -f "$ZIP"
+          (cd "$DIST" && zip -9 "../${ZIP}" ./*.ipk README.md)
+          ls -lh "$ZIP"
+
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, pathlib
+          ipks = sorted(p.name for p in pathlib.Path("dist").glob("*.ipk"))
+          print(f"ipk_count={len(ipks)}")
+          print(f"ipk_json={json.dumps(ipks)}")
+          PY
+          echo "zip_name=${ZIP}" >> "$GITHUB_OUTPUT"
 
       # Only save when there was no exact key hit (save fails if key already exists)
       - name: Save build cache
@@ -626,18 +622,17 @@ jobs:
             .ccache
           key: passwall-${{ runner.os }}-${{ env.PKG_ARCH }}-lede-${{ steps.refs.outputs.lede_sha }}-pw-${{ steps.refs.outputs.passwall_ref }}-pkgs-${{ steps.refs.outputs.packages_ref }}
 
-      - name: Upload artifact
+      # Staging bundle for the matrix job (flat IPKs only — no nested archives)
+      - name: Upload staging dist (for per-file publish)
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.collect.outputs.out_dir }}
-          path: |
-            ${{ steps.collect.outputs.out_dir }}.tar.gz
-            ${{ steps.collect.outputs.out_dir }}.zip
-            ${{ steps.collect.outputs.out_dir }}/README.md
+          name: passwall-dist-staging
+          path: dist/
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 1
+          compression-level: 0
 
-      - name: Publish GitHub Release
+      - name: Publish GitHub Release (each IPK + one zip)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: passwall-${{ github.run_number }}-${{ env.PKG_ARCH }}
@@ -645,7 +640,8 @@ jobs:
           body: |
             Automated build of **luci-app-passwall** from [Openwrt-Passwall](https://github.com/Openwrt-Passwall/openwrt-passwall) (+ [packages](https://github.com/Openwrt-Passwall/openwrt-passwall-packages)).
 
-            LEDE stock copies of the same package names are **purged** before build.
+            - **Per-package download**: each `.ipk` is a separate Release asset / Actions Artifact
+            - **All-in-one**: only one `${{ steps.collect.outputs.zip_name }}` (no tar.gz, no nested copies)
 
             | Item | Value |
             | --- | --- |
@@ -655,19 +651,59 @@ jobs:
             | LEDE | `${{ github.sha }}` |
             | passwall | `${{ steps.refs.outputs.passwall_ref }}` |
             | passwall-packages | `${{ steps.refs.outputs.packages_ref }}` |
-            | Workflow run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
-
-            Download the `.zip` / `.tar.gz`, extract, copy `all/*.ipk` to the router:
+            | IPK count | ${{ steps.collect.outputs.ipk_count }} |
+            | Workflow | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
 
             ```sh
             opkg update
-            opkg install ./*.ipk
+            opkg install ./luci-app-passwall_*.ipk
+            # plus cores you need, e.g. xray-core / sing-box
             ```
-
-            IPK count: **${{ steps.collect.outputs.ipk_count }}**
           files: |
-            ${{ steps.collect.outputs.out_dir }}.tar.gz
-            ${{ steps.collect.outputs.out_dir }}.zip
+            dist/*.ipk
+            dist/README.md
+            ${{ steps.collect.outputs.zip_name }}
           draft: false
           prerelease: false
           generate_release_notes: false
+
+  # ---------------------------------------------------------------------------
+  # List every IPK as its own Actions Artifact for on-demand download.
+  # ---------------------------------------------------------------------------
+  publish-ipk-artifacts:
+    name: Artifact ${{ matrix.ipk }}
+    needs: build
+    if: ${{ needs.build.outputs.ipks != '' && needs.build.outputs.ipks != '[]' }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        ipk: ${{ fromJson(needs.build.outputs.ipks) }}
+    steps:
+      - name: Download staging dist
+        uses: actions/download-artifact@v4
+        with:
+          name: passwall-dist-staging
+          path: dist
+
+      - name: Upload ${{ matrix.ipk }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.ipk }}
+          path: dist/${{ matrix.ipk }}
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  # Drop the temporary bulk staging artifact so Artifacts only lists each IPK.
+  cleanup-staging:
+    name: Cleanup staging artifact
+    needs: publish-ipk-artifacts
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Delete passwall-dist-staging
+        uses: geekyeggo/delete-artifact@v5
+        with:
+          name: passwall-dist-staging
+          failOnError: false
