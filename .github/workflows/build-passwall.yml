@@ -105,13 +105,99 @@ jobs:
       - name: Update and install feeds
         run: |
           ./scripts/feeds update -a
-          ./scripts/feeds install -a
-          ./scripts/feeds install -a -f -p passwall_packages || true
-          ./scripts/feeds install -a -f -p passwall || true
-          ./scripts/feeds install luci-app-passwall
 
-          echo "==== passwall package paths ===="
-          ls -d package/feeds/passwall*/* 2>/dev/null | head -80 || true
+          # -----------------------------------------------------------------
+          # Resolve name conflicts: prefer Openwrt-Passwall over stock feeds.
+          # coolsnowwolf/luci ships an older luci-app-passwall (e.g. 26.4.x).
+          # coolsnowwolf/packages ships overlapping deps (xray-core, sing-box, …).
+          # Drop those so feeds install / -f will wire package/feeds/* to
+          # passwall + passwall_packages only.
+          # -----------------------------------------------------------------
+          echo "==== remove conflicting packages from luci / packages feeds ===="
+          rm -rf feeds/luci/applications/luci-app-passwall
+          # Some luci trees use luci-app-passwall2; leave it unless it collides.
+          CONFLICT_PKGS=(
+            chinadns-ng
+            dns2socks
+            geoview
+            hysteria
+            ipt2socks
+            microsocks
+            naiveproxy
+            shadow-tls
+            shadowsocks-rust
+            shadowsocksr-libev
+            simple-obfs
+            sing-box
+            tcping
+            v2ray-geodata
+            v2ray-plugin
+            xray-core
+            xray-plugin
+          )
+          for pkg in "${CONFLICT_PKGS[@]}"; do
+            rm -rf "feeds/packages/net/${pkg}"
+            rm -rf "feeds/packages/utils/${pkg}"
+            rm -rf "feeds/packages/lang/${pkg}"
+          done
+
+          # Rebuild feed indexes so deleted packages are gone from the catalog
+          ./scripts/feeds update -i
+
+          # Install base feeds (luci/packages/… without the removed names)
+          ./scripts/feeds install -a
+
+          # Force-link Openwrt-Passwall feeds last so they own the package names
+          ./scripts/feeds install -a -f -p passwall_packages
+          ./scripts/feeds install -a -f -p passwall
+          ./scripts/feeds install -f luci-app-passwall
+
+          # Safety: purge any leftover install links still pointing at luci/packages
+          rm -rf package/feeds/luci/luci-app-passwall
+          for pkg in "${CONFLICT_PKGS[@]}"; do
+            if [ -e "package/feeds/packages/${pkg}" ]; then
+              target="$(readlink -f "package/feeds/packages/${pkg}" 2>/dev/null || true)"
+              case "$target" in
+                */feeds/passwall_packages/*) ;; # keep if somehow linked correctly
+                *)
+                  echo "remove residual package/feeds/packages/${pkg} -> ${target:-n/a}"
+                  rm -rf "package/feeds/packages/${pkg}"
+                  ;;
+              esac
+            fi
+          done
+
+          # Re-force after cleanup so package/feeds/passwall* is complete
+          ./scripts/feeds install -a -f -p passwall_packages
+          ./scripts/feeds install -a -f -p passwall
+
+          echo "==== verify luci-app-passwall source (expect passwall feed / 26.x new) ===="
+          if [ ! -d package/feeds/passwall/luci-app-passwall ]; then
+            echo "ERROR: luci-app-passwall not installed from passwall feed"
+            find package/feeds -maxdepth 3 -type d -name 'luci-app-passwall' || true
+            exit 1
+          fi
+          if [ -e package/feeds/luci/luci-app-passwall ]; then
+            echo "ERROR: stale luci feed luci-app-passwall still present"
+            ls -la package/feeds/luci/luci-app-passwall
+            exit 1
+          fi
+          echo "-- Makefile from package/feeds/passwall/luci-app-passwall --"
+          grep -E '^PKG_(NAME|VERSION|RELEASE)' package/feeds/passwall/luci-app-passwall/Makefile || true
+          echo "-- passwall package paths --"
+          ls -d package/feeds/passwall/* package/feeds/passwall_packages/* 2>/dev/null | head -80 || true
+          echo "-- ensure key deps resolve to passwall_packages --"
+          for pkg in xray-core sing-box chinadns-ng; do
+            if [ -e "package/feeds/passwall_packages/${pkg}" ]; then
+              echo "OK  passwall_packages/${pkg}"
+              grep -E '^PKG_(NAME|VERSION)' "package/feeds/passwall_packages/${pkg}/Makefile" | head -5 || true
+            else
+              echo "WARN missing passwall_packages/${pkg}"
+            fi
+            if [ -e "package/feeds/packages/${pkg}" ]; then
+              echo "WARN residual packages/${pkg} still exists -> $(readlink -f package/feeds/packages/${pkg} 2>/dev/null || echo not-a-link)"
+            fi
+          done
 
       - name: Generate .config (AP8220 + passwall)
         run: |
