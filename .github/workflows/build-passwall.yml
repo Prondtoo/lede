@@ -81,7 +81,6 @@ jobs:
             python3-pyelftools python3-setuptools qemu-utils rsync scons \
             squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip \
             vim wget xmlto xxd zip zlib1g-dev zstd
-          sudo -E timedatectl set-timezone "$TZ"
           ccache -V || true
           df -h
 
